@@ -1,0 +1,82 @@
+name: join-release-parts
+
+# 用途：本机网络对单个 HTTP 请求体有 ~22 秒上限，无法一次性上传 174 MB 安装包。
+# 因此把安装包切片上传为 Release 资产，再由本工作流在 GitHub 侧合并成单个资产，
+# 并用 PAT 把结果投递到目标仓库的 Release。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag in the target repositories'
+        required: true
+      parts_tag:
+        description: 'Release tag holding the parts in THIS repository'
+        required: true
+      prefix:
+        description: 'Asset name prefix of the parts'
+        required: true
+      output_name:
+        description: 'Final asset file name'
+        required: true
+      sha256:
+        description: 'Expected sha256 of the joined file'
+        required: true
+      target_repo_1:
+        description: 'owner/repo #1 to receive the final asset'
+        required: true
+      target_repo_2:
+        description: 'owner/repo #2 to receive the final asset'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  join:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download parts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p parts
+          gh release download "${{ inputs.parts_tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${{ inputs.prefix }}*" \
+            --dir parts
+          echo "part count: $(ls parts | wc -l)"
+
+      - name: Join and verify sha256
+        run: |
+          set -euo pipefail
+          cd parts
+          cat $(ls | sort) > "../${{ inputs.output_name }}"
+          cd ..
+          echo "size   : $(stat -c%s "${{ inputs.output_name }}")"
+          ACTUAL=$(sha256sum "${{ inputs.output_name }}" | cut -d' ' -f1)
+          echo "sha256 : $ACTUAL"
+          if [ "$ACTUAL" != "${{ inputs.sha256 }}" ]; then
+            echo "::error::SHA256 MISMATCH"
+            exit 1
+          fi
+
+      - name: Upload to target repository 1
+        env:
+          GH_TOKEN: ${{ secrets.DELIVER_PAT }}
+        run: |
+          gh release upload "${{ inputs.tag }}" "${{ inputs.output_name }}" \
+            --repo "${{ inputs.target_repo_1 }}" --clobber
+          gh api "repos/${{ inputs.target_repo_1 }}/releases/tags/${{ inputs.tag }}" \
+            --jq '.assets[] | select(.name=="${{ inputs.output_name }}") | "\(.name) \(.size) \(.digest)"'
+
+      - name: Upload to target repository 2
+        if: ${{ inputs.target_repo_2 != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.DELIVER_PAT }}
+        run: |
+          gh release upload "${{ inputs.tag }}" "${{ inputs.output_name }}" \
+            --repo "${{ inputs.target_repo_2 }}" --clobber
+          gh api "repos/${{ inputs.target_repo_2 }}/releases/tags/${{ inputs.tag }}" \
+            --jq '.assets[] | select(.name=="${{ inputs.output_name }}") | "\(.name) \(.size) \(.digest)"'
