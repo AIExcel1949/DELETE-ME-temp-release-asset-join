@@ -71,7 +71,10 @@ jobs:
           for R in "${{ inputs.target_repo_1 }}" "${{ inputs.target_repo_2 }}"; do
             if [ -z "$R" ]; then continue; fi
             echo "===================== $R ====================="
-            gh release upload "$TAG" "$F#${NAME}.staged" --repo "$R" --clobber
+            # 注意：gh release upload 不支持 "file#assetname" 重命名（会直接用原文件名），
+            # 所以用「把文件复制成 <name>.staged」来得到 staged 资产名。
+            cp -f "$F" "out/${NAME}.staged"
+            gh release upload "$TAG" "out/${NAME}.staged" --repo "$R" --clobber
             SID=$(gh api "repos/$R/releases/tags/$TAG" \
                   --jq ".assets[] | select(.name==\"${NAME}.staged\") | .id")
             echo "staged asset id = $SID"
