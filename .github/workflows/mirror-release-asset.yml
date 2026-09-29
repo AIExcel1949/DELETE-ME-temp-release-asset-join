@@ -1,0 +1,106 @@
+name: mirror-release-asset
+
+# 用途：把某个仓库 Release 里的既有资产镜像/投递到另一个仓库的 Release，全程在 GitHub
+#      侧完成、不经过本机（本机对单个 HTTP 请求体有约 22 秒上限，168 MB 走本机必失败）。
+#      源仓库若是私有库，用 PAT（secret DELIVER_PAT）读取。
+#
+# 投递策略与 deliver-asset.yml 一致：先上传 "<name>.staged"，确认落地拿到 asset id 后
+# 再删除旧资产、把 staged 改名为正式名 —— 全程不存在「既无旧资产也无新资产」的窗口。
+
+on:
+  workflow_dispatch:
+    inputs:
+      src_repo:
+        description: 'owner/repo to read from (may be private)'
+        required: true
+      src_tag:
+        description: 'Release tag in the source repository'
+        required: true
+      src_pattern:
+        description: 'Source asset glob, e.g. *.dmg'
+        required: true
+      output_name:
+        description: 'Final asset file name in the target repositories'
+        required: true
+      sha256:
+        description: 'Expected sha256 of the asset'
+        required: true
+      tag:
+        description: 'Release tag in the target repositories'
+        required: true
+      target_repo_1:
+        description: 'owner/repo #1 to receive the asset'
+        required: true
+      target_repo_2:
+        description: 'owner/repo #2 to receive the asset'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download source asset
+        env:
+          GH_TOKEN: ${{ secrets.DELIVER_PAT }}
+        run: |
+          set -euo pipefail
+          mkdir -p src out
+          gh release download "${{ inputs.src_tag }}" \
+            --repo "${{ inputs.src_repo }}" \
+            --pattern "${{ inputs.src_pattern }}" \
+            --dir src --clobber
+          ls -l src
+          N=$(ls -1 src | wc -l)
+          echo "source files: $N"
+          if [ "$N" -ne 1 ]; then
+            echo "::error::expected exactly 1 source asset, got $N"
+            exit 1
+          fi
+          cp -f src/* "out/${{ inputs.output_name }}"
+
+      - name: Verify size and sha256
+        run: |
+          set -euo pipefail
+          F="out/${{ inputs.output_name }}"
+          echo "size   : $(stat -c%s "$F")"
+          ACTUAL=$(sha256sum "$F" | cut -d' ' -f1)
+          echo "sha256 : $ACTUAL"
+          if [ "$ACTUAL" != "${{ inputs.sha256 }}" ]; then
+            echo "::error::SHA256 MISMATCH (expected ${{ inputs.sha256 }})"
+            exit 1
+          fi
+
+      - name: Deliver to target repositories
+        env:
+          GH_TOKEN: ${{ secrets.DELIVER_PAT }}
+        run: |
+          set -euo pipefail
+          NAME="${{ inputs.output_name }}"
+          TAG="${{ inputs.tag }}"
+          F="out/$NAME"
+          for R in "${{ inputs.target_repo_1 }}" "${{ inputs.target_repo_2 }}"; do
+            if [ -z "$R" ]; then continue; fi
+            echo "===================== $R ====================="
+            # gh release upload 不支持 "file#assetname" 重命名（会静默用原文件名并 clobber），
+            # 所以先把文件复制成 <name>.staged 来得到 staged 资产名。
+            cp -f "$F" "out/${NAME}.staged"
+            gh release upload "$TAG" "out/${NAME}.staged" --repo "$R" --clobber
+            SID=$(gh api "repos/$R/releases/tags/$TAG" \
+                  --jq ".assets[] | select(.name==\"${NAME}.staged\") | .id")
+            echo "staged asset id = $SID"
+            if [ -z "$SID" ]; then echo "::error::staged asset not found in $R"; exit 1; fi
+            OLD=$(gh api "repos/$R/releases/tags/$TAG" \
+                  --jq ".assets[] | select(.name==\"$NAME\") | .id" || true)
+            if [ -n "$OLD" ]; then
+              gh api -X DELETE "repos/$R/releases/assets/$OLD"
+              echo "deleted previous asset id=$OLD"
+            fi
+            gh api -X PATCH "repos/$R/releases/assets/$SID" -f name="$NAME" > /dev/null
+            echo "----- final state of $R -----"
+            gh api "repos/$R/releases/tags/$TAG" \
+              --jq ".assets[] | \"\(.name)  \(.size)  \(.digest // \"-\")  id=\(.id)\""
+          done
