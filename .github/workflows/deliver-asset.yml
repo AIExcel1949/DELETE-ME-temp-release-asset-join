@@ -1,0 +1,89 @@
+name: deliver-asset
+
+# 用途：本机对单个 HTTP 请求体有约 22 秒上限，无法一次性上传 174 MB 的安装包。
+# 做法：把安装包切成 4 片（每片约 41.7 MB）用 git push（SSH 通道不受限）送到本仓库的
+#      payload 分支，再由本工作流在 GitHub 侧合并、校验 sha256，并用 PAT 投递到目标
+#      仓库的 Release。
+#
+# 投递策略：先把成品上传为 "<name>.staged"，确认落地后再删除旧资产、把 staged 改名为
+#          正式名。全程不存在「既无旧资产也无新资产」的窗口。
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload_ref:
+        description: 'Branch holding parts/*.bin'
+        required: true
+        default: 'payload'
+      output_name:
+        description: 'Final asset file name'
+        required: true
+      sha256:
+        description: 'Expected sha256 of the joined file'
+        required: true
+      tag:
+        description: 'Release tag in the target repositories'
+        required: true
+      target_repo_1:
+        description: 'owner/repo #1 to receive the final asset'
+        required: true
+      target_repo_2:
+        description: 'owner/repo #2 to receive the final asset'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout payload branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.payload_ref }}
+          fetch-depth: 1
+
+      - name: Join and verify sha256
+        run: |
+          set -euo pipefail
+          ls -l parts
+          mkdir -p out
+          cat $(ls parts/*.bin | sort) > "out/${{ inputs.output_name }}"
+          SIZE=$(stat -c%s "out/${{ inputs.output_name }}")
+          ACTUAL=$(sha256sum "out/${{ inputs.output_name }}" | cut -d' ' -f1)
+          echo "size   : $SIZE"
+          echo "sha256 : $ACTUAL"
+          if [ "$ACTUAL" != "${{ inputs.sha256 }}" ]; then
+            echo "::error::SHA256 MISMATCH (expected ${{ inputs.sha256 }})"
+            exit 1
+          fi
+
+      - name: Deliver to target repositories
+        env:
+          GH_TOKEN: ${{ secrets.DELIVER_PAT }}
+        run: |
+          set -euo pipefail
+          NAME="${{ inputs.output_name }}"
+          TAG="${{ inputs.tag }}"
+          F="out/$NAME"
+          for R in "${{ inputs.target_repo_1 }}" "${{ inputs.target_repo_2 }}"; do
+            if [ -z "$R" ]; then continue; fi
+            echo "===================== $R ====================="
+            gh release upload "$TAG" "$F#${NAME}.staged" --repo "$R" --clobber
+            SID=$(gh api "repos/$R/releases/tags/$TAG" \
+                  --jq ".assets[] | select(.name==\"${NAME}.staged\") | .id")
+            echo "staged asset id = $SID"
+            if [ -z "$SID" ]; then echo "::error::staged asset not found in $R"; exit 1; fi
+            OLD=$(gh api "repos/$R/releases/tags/$TAG" \
+                  --jq ".assets[] | select(.name==\"$NAME\") | .id" || true)
+            if [ -n "$OLD" ]; then
+              gh api -X DELETE "repos/$R/releases/assets/$OLD"
+              echo "deleted previous asset id=$OLD"
+            fi
+            gh api -X PATCH "repos/$R/releases/assets/$SID" -f name="$NAME" > /dev/null
+            echo "----- final state of $R -----"
+            gh api "repos/$R/releases/tags/$TAG" \
+              --jq ".assets[] | \"\(.name)  \(.size)  \(.digest // \"-\")  id=\(.id)\""
+          done
